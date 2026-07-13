@@ -1,21 +1,23 @@
 import { Router, Request, Response } from 'express';
 import { body, query, validationResult } from 'express-validator';
+import jwt from 'jsonwebtoken';
 import { Content } from '../models/Content';
 import { User } from '../models/User';
 import { Subscription } from '../models/Subscription';
+import { logger } from '../utils/logger';
+import { cache } from '../utils/cache';
 
 const router = Router();
 
-// Middleware para verificar autenticación
+// Middleware que EXIGE autenticación (usado en escritura/likes)
 const authenticateToken = (req: Request & { user?: any }, res: Response, next: any) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
-  
+
   if (!token) {
     return res.status(401).json({ error: 'Token requerido' });
   }
 
   try {
-    const jwt = require('jsonwebtoken');
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
     req.user = decoded;
     next();
@@ -24,39 +26,86 @@ const authenticateToken = (req: Request & { user?: any }, res: Response, next: a
   }
 };
 
-// Obtener contenido de una creadora
-router.get('/creator/:creatorId', [
+// Middleware que intenta identificar al usuario PERO no bloquea si no hay token
+// (necesario para saber si está suscrito sin obligar a loguearse para ver el listado)
+const optionalAuth = (req: Request & { user?: any }, res: Response, next: any) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (token) {
+    try {
+      req.user = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
+    } catch {
+      // token inválido/expirado -> seguimos como anónimo, no es un error fatal aquí
+    }
+  }
+  next();
+};
+
+// Obtener contenido de una creadora (con paywall real)
+router.get('/creator/:creatorId', optionalAuth, [
   query('page').optional().isInt({ min: 1 }),
   query('limit').optional().isInt({ min: 1, max: 50 })
 ], async (req: Request & { user?: any }, res: Response) => {
   try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
     const { creatorId } = req.params;
     const page = parseInt(req.query.page as string) || 1;
     const limit = parseInt(req.query.limit as string) || 10;
     const skip = (page - 1) * limit;
 
-    // Verificar si el usuario está suscrito
-    let isSubscribed = false;
-    if (req.user) {
-      const subscription = await Subscription.findOne({
-        fanId: req.user.userId,
-        creatorId,
-        status: 'active'
-      });
-      isSubscribed = !!subscription;
+    const viewerId = req.user?.userId as string | undefined;
+    const isOwner = viewerId === creatorId;
+
+    // Verificar si el usuario está suscrito (se cachea 30s por par fan/creadora,
+    // es info que puede tolerar unos segundos de retraso)
+    let isSubscribed = isOwner;
+    if (viewerId && !isOwner) {
+      isSubscribed = await cache.wrap(
+        `sub:${viewerId}:${creatorId}`,
+        30,
+        async () => {
+          const subscription = await Subscription.findOne({
+            fanId: viewerId,
+            creatorId,
+            status: 'active'
+          });
+          return !!subscription;
+        }
+      );
     }
 
-    // Obtener contenido
-    const content = await Content.find({ creatorId })
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit)
-      .populate('creatorId', 'username verificationStatus');
+    // El listado "crudo" (sin gating) se cachea por creatorId+page porque es
+    // igual para todo el mundo; el gating de fileUrl se aplica DESPUÉS del caché,
+    // por usuario, así nunca se cachea contenido pago filtrado incorrectamente.
+    const cacheKey = `content:${creatorId}:${page}:${limit}`;
+    const { content, total } = await cache.wrap(cacheKey, 45, async () => {
+      const rawContent = await Content.find({ creatorId })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .populate('creatorId', 'username verificationStatus')
+        .lean();
 
-    const total = await Content.countDocuments({ creatorId });
+      const totalCount = await Content.countDocuments({ creatorId });
+      return { content: rawContent, total: totalCount };
+    });
+
+    // PAYWALL: solo se expone fileUrl si el post es gratis, o el usuario está
+    // suscrito activo, o es la propia creadora. Si no, se oculta la URL real.
+    const gatedContent = content.map((item: any) => {
+      const unlocked = item.isFree || isSubscribed;
+      return {
+        ...item,
+        fileUrl: unlocked ? item.fileUrl : null,
+        locked: !unlocked,
+      };
+    });
 
     res.json({
-      content,
+      content: gatedContent,
       pagination: {
         page,
         limit,
@@ -67,7 +116,7 @@ router.get('/creator/:creatorId', [
     });
 
   } catch (error) {
-    console.error('Error al obtener contenido:', error);
+    logger.error('Error al obtener contenido', { error, creatorId: req.params.creatorId });
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
@@ -89,13 +138,13 @@ router.post('/upload', authenticateToken, [
 
     const user = await User.findById(req.user.userId);
     if (!user || user.role !== 'model' || user.verificationStatus !== 'approved') {
-      return res.status(403).json({ 
-        error: 'Solo creadoras verificadas pueden subir contenido' 
+      return res.status(403).json({
+        error: 'Solo creadoras verificadas pueden subir contenido'
       });
     }
 
     const { title, description, type, isFree, price, tags } = req.body;
-    
+
     const content = new Content({
       creatorId: user._id,
       title,
@@ -109,13 +158,19 @@ router.post('/upload', authenticateToken, [
     await content.save();
     await content.populate('creatorId', 'username');
 
+    // Invalidamos el caché de listado de esta creadora: el nuevo post debe
+    // verse de inmediato, no hasta que expire el TTL de 45s
+    cache.invalidatePrefix(`content:${user._id}:`);
+
+    logger.info('Contenido subido', { creatorId: user._id.toString(), contentId: content._id, type });
+
     res.status(201).json({
       message: 'Contenido subido exitosamente',
       content
     });
 
   } catch (error) {
-    console.error('Error al subir contenido:', error);
+    logger.error('Error al subir contenido', { error, userId: req.user?.userId });
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
@@ -131,26 +186,26 @@ router.post('/:contentId/like', authenticateToken, async (req: Request & { user?
       return res.status(404).json({ error: 'Contenido no encontrado' });
     }
 
-    // Verificar si ya dio like
-    const alreadyLiked = content.likes.includes(userId);
+    const alreadyLiked = content.likes.some((id) => id.toString() === userId);
     if (alreadyLiked) {
-      // Quitar like usando $pull
       await Content.findByIdAndUpdate(
         contentId,
         { $pull: { likes: userId } }
       );
     } else {
-      // Agregar like
       content.likes.push(userId);
       await content.save();
     }
-    res.json({ 
+
+    cache.invalidatePrefix(`content:${content.creatorId}:`);
+
+    res.json({
       message: alreadyLiked ? 'Like quitado' : 'Like agregado',
-      likesCount: content.likes.length
+      likesCount: alreadyLiked ? content.likes.length - 1 : content.likes.length
     });
 
   } catch (error) {
-    console.error('Error en like:', error);
+    logger.error('Error en like', { error, contentId: req.params.contentId });
     res.status(500).json({ error: 'Error del servidor' });
   }
 });

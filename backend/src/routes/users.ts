@@ -1,19 +1,20 @@
 import { Router, Request, Response } from 'express';
-import { query } from 'express-validator';
+import { body, validationResult } from 'express-validator';
+import jwt from 'jsonwebtoken';
 import { User } from '../models/User';
+import { logger } from '../utils/logger';
+import { cache } from '../utils/cache';
 
 const router = Router();
 
-// Middleware para verificar autenticación
 const authenticateToken = (req: Request & { user?: any }, res: Response, next: any) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
-  
+
   if (!token) {
     return res.status(401).json({ error: 'Token requerido' });
   }
 
   try {
-    const jwt = require('jsonwebtoken');
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
     req.user = decoded;
     next();
@@ -36,21 +37,21 @@ router.get('/profile', authenticateToken, async (req: Request & { user?: any }, 
     res.json({ user });
 
   } catch (error) {
-    console.error('Error al obtener perfil:', error);
+    logger.error('Error al obtener perfil', { error, userId: req.user?.userId });
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
 // Actualizar perfil
 router.put('/profile', authenticateToken, [
-  require('express-validator').body('username').optional().isLength({ min: 3, max: 30 }).trim(),
-  require('express-validator').body('profile.bio').optional().isLength({ max: 500 }).trim(),
-  require('express-validator').body('profile.instagram').optional().isURL(),
-  require('express-validator').body('profile.x').optional().isURL(),
-  require('express-validator').body('profile.website').optional().isURL()
+  body('username').optional().isLength({ min: 3, max: 30 }).trim(),
+  body('profile.bio').optional().isLength({ max: 500 }).trim(),
+  body('profile.instagram').optional().isURL(),
+  body('profile.x').optional().isURL(),
+  body('profile.website').optional().isURL()
 ], async (req: Request & { user?: any }, res: Response) => {
   try {
-    const errors = require('express-validator').validationResult(req);
+    const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({ errors: errors.array() });
     }
@@ -58,11 +59,10 @@ router.put('/profile', authenticateToken, [
     const { username, profile, subscriptionPrice } = req.body;
     const userId = req.user.userId;
 
-    // Verificar si el username ya está en uso
     if (username) {
-      const existingUser = await User.findOne({ 
-        username, 
-        _id: { $ne: userId } 
+      const existingUser = await User.findOne({
+        username,
+        _id: { $ne: userId }
       });
       if (existingUser) {
         return res.status(400).json({ error: 'El nombre de usuario ya está en uso' });
@@ -71,7 +71,7 @@ router.put('/profile', authenticateToken, [
 
     const updatedUser = await User.findByIdAndUpdate(
       userId,
-      { 
+      {
         ...(username && { username }),
         ...(profile && { profile }),
         ...(subscriptionPrice !== undefined && { subscriptionPrice })
@@ -79,64 +79,27 @@ router.put('/profile', authenticateToken, [
       { new: true }
     ).select('-password');
 
+    // Si cambió el username/bio/precio, el perfil público cacheado en
+    // /api/creators/:id quedaría desactualizado hasta 60s -> lo invalidamos ya.
+    cache.del(`creators:profile:${userId}`);
+    cache.invalidatePrefix('creators:list:');
+
+    logger.info('Perfil actualizado', { userId });
+
     res.json({
       message: 'Perfil actualizado exitosamente',
       user: updatedUser
     });
 
   } catch (error) {
-    console.error('Error al actualizar perfil:', error);
+    logger.error('Error al actualizar perfil', { error, userId: req.user?.userId });
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-// Obtener lista de creadoras
-router.get('/creators', [
-  query('page').optional().isInt({ min: 1 }),
-  query('limit').optional().isInt({ min: 1, max: 50 }),
-  query('search').optional().isLength({ max: 100 }).trim()
-], async (req: Request, res: Response) => {
-  try {
-    const page = parseInt(req.query.page as string) || 1;
-    const limit = parseInt(req.query.limit as string) || 10;
-    const skip = (page - 1) * limit;
-    const search = req.query.search as string;
-
-    // Construir filtro
-    const filter: any = { 
-      role: 'model',
-      verificationStatus: 'approved'
-    };
-
-    if (search) {
-      filter.$or = [
-        { username: { $regex: search, $options: 'i' } },
-        { 'profile.bio': { $regex: search, $options: 'i' } }
-      ];
-    }
-
-    const creators = await User.find(filter)
-      .select('-password')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
-
-    const total = await User.countDocuments(filter);
-
-    res.json({
-      creators,
-      pagination: {
-        page,
-        limit,
-        total,
-        pages: Math.ceil(total / limit)
-      }
-    });
-
-  } catch (error) {
-    console.error('Error al obtener creadoras:', error);
-    res.status(500).json({ error: 'Error del servidor' });
-  }
-});
+// NOTA: el listado/búsqueda de creadoras vive en GET /api/creators (con caché
+// y conteo de suscriptores agregado). Antes existía un duplicado aquí en
+// /api/users/creators sin caché — se eliminó para no tener dos fuentes de
+// verdad divergentes. Si el frontend lo llamaba, debe apuntar a /api/creators.
 
 export default router;

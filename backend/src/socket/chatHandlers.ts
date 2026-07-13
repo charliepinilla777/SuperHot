@@ -2,6 +2,8 @@ import { Server, Socket } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import { ChatMessage } from '../models/ChatMessage';
 import { Subscription } from '../models/Subscription';
+import { logger } from '../utils/logger';
+import { containsForbiddenContact } from '../utils/policy';
 
 interface AuthenticatedSocket extends Socket {
   userId?: string;
@@ -9,10 +11,9 @@ interface AuthenticatedSocket extends Socket {
 }
 
 export const setupSocketHandlers = (io: Server) => {
-  // Middleware de autenticación para Socket.IO
   io.use((socket: AuthenticatedSocket, next: (err?: Error) => void) => {
     const token = socket.handshake.auth.token;
-    
+
     if (!token) {
       return next(new Error('Token requerido'));
     }
@@ -28,13 +29,11 @@ export const setupSocketHandlers = (io: Server) => {
   });
 
   io.on('connection', (socket: AuthenticatedSocket) => {
-    console.log(`🔗 Usuario conectado: ${socket.userId}`);
+    logger.info('Usuario conectado por socket', { userId: socket.userId });
 
-    // Unirse a una sala de chat específica
     socket.on('join-room', (data: { creatorId: string }) => {
       const { creatorId } = data;
-      
-      // Verificar si está suscrito
+
       Subscription.findOne({
         fanId: socket.userId,
         creatorId,
@@ -46,20 +45,30 @@ export const setupSocketHandlers = (io: Server) => {
         } else {
           socket.emit('error', { message: 'Necesitas estar suscrito para unirte al chat' });
         }
+      }).catch((error) => {
+        logger.error('Error al verificar suscripción en join-room', { error, userId: socket.userId, creatorId });
+        socket.emit('error', { message: 'Error al unirse a la sala' });
       });
     });
 
-    // Enviar mensaje
-    socket.on('send-message', async (data: { 
-      creatorId: string; 
-      content: string; 
+    socket.on('send-message', async (data: {
+      creatorId: string;
+      content: string;
       type?: 'text' | 'image' | 'video';
       fileUrl?: string;
     }) => {
       const { creatorId, content, type = 'text', fileUrl } = data;
-      
+
       try {
-        // Verificar suscripción
+        // Mismo filtro anti-contacto/escort que en la ruta REST /chat/send.
+        // El socket es otra puerta de entrada al mismo dato, tiene que
+        // pasar por la misma validación o el filtro del REST no sirve de nada.
+        if (type === 'text' && containsForbiddenContact(content)) {
+          logger.warn('Mensaje de socket bloqueado por política de contacto', { senderId: socket.userId, creatorId });
+          socket.emit('error', { message: 'No se permite compartir teléfonos, WhatsApp/Telegram ni proponer encuentros presenciales.' });
+          return;
+        }
+
         const subscription = await Subscription.findOne({
           fanId: socket.userId,
           creatorId,
@@ -71,7 +80,6 @@ export const setupSocketHandlers = (io: Server) => {
           return;
         }
 
-        // Crear mensaje
         const message = new ChatMessage({
           senderId: socket.userId,
           receiverId: creatorId,
@@ -86,23 +94,19 @@ export const setupSocketHandlers = (io: Server) => {
           { path: 'receiverId', select: 'username' }
         ]);
 
-        // Enviar a la sala del creador
         io.to(`creator-${creatorId}`).emit('new-message', message);
-        
-        // Guardar en sala del remitente
         socket.join(`user-${socket.userId}-${creatorId}`);
 
       } catch (error) {
-        console.error('Error al enviar mensaje:', error);
+        logger.error('Error al enviar mensaje por socket', { error, userId: socket.userId, creatorId });
         socket.emit('error', { message: 'Error al enviar mensaje' });
       }
     });
 
-    // Marcar mensajes como leídos
     socket.on('mark-read', async (data: { creatorId: string }) => {
       try {
         await ChatMessage.updateMany(
-          { 
+          {
             receiverId: socket.userId,
             senderId: data.creatorId,
             isRead: false
@@ -112,16 +116,14 @@ export const setupSocketHandlers = (io: Server) => {
 
         socket.emit('messages-marked-read');
       } catch (error) {
-        console.error('Error al marcar mensajes como leídos:', error);
+        logger.error('Error al marcar mensajes como leídos', { error, userId: socket.userId });
       }
     });
 
-    // Obtener historial de chat
     socket.on('get-chat-history', async (data: { creatorId: string }) => {
       try {
         const { creatorId } = data;
-        
-        // Verificar suscripción
+
         const subscription = await Subscription.findOne({
           fanId: socket.userId,
           creatorId,
@@ -133,7 +135,6 @@ export const setupSocketHandlers = (io: Server) => {
           return;
         }
 
-        // Obtener mensajes
         const messages = await ChatMessage.find({
           $or: [
             { senderId: socket.userId, receiverId: creatorId },
@@ -148,16 +149,15 @@ export const setupSocketHandlers = (io: Server) => {
         ]);
 
         socket.emit('chat-history', messages);
-        
+
       } catch (error) {
-        console.error('Error al obtener historial:', error);
+        logger.error('Error al obtener historial de chat', { error, userId: socket.userId });
         socket.emit('error', { message: 'Error al obtener historial de chat' });
       }
     });
 
-    // Desconexión
     socket.on('disconnect', () => {
-      console.log(`🔌 Usuario desconectado: ${socket.userId}`);
+      logger.info('Usuario desconectado de socket', { userId: socket.userId });
     });
   });
 };

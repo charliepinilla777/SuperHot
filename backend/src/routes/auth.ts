@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { body, validationResult } from 'express-validator';
 import { User } from '../models/User';
+import { logger } from '../utils/logger';
 
 const router = Router();
 
@@ -62,7 +63,7 @@ router.post('/register', [
     });
 
   } catch (error) {
-    console.error('Error en registro:', error);
+    logger.error('Error en registro', { error });
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
@@ -112,7 +113,7 @@ router.post('/login', [
     });
 
   } catch (error) {
-    console.error('Error en login:', error);
+    logger.error('Error en login', { error });
     res.status(500).json({ error: 'Error del servidor' });
   }
 });

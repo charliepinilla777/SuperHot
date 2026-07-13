@@ -1,20 +1,21 @@
 import { Router, Request, Response } from 'express';
-import { body, query } from 'express-validator';
+import { body, query, validationResult } from 'express-validator';
+import jwt from 'jsonwebtoken';
 import { ChatMessage } from '../models/ChatMessage';
 import { Subscription } from '../models/Subscription';
+import { logger } from '../utils/logger';
+import { containsForbiddenContact } from '../utils/policy';
 
 const router = Router();
 
-// Middleware para verificar autenticación
 const authenticateToken = (req: Request & { user?: any }, res: Response, next: any) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
-  
+
   if (!token) {
     return res.status(401).json({ error: 'Token requerido' });
   }
 
   try {
-    const jwt = require('jsonwebtoken');
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'fallback-secret');
     req.user = decoded;
     next();
@@ -28,7 +29,6 @@ router.get('/conversations', authenticateToken, async (req: Request & { user?: a
   try {
     const userId = req.user.userId;
 
-    // Obtener conversaciones únicas
     const conversations = await ChatMessage.aggregate([
       {
         $match: {
@@ -73,7 +73,7 @@ router.get('/conversations', authenticateToken, async (req: Request & { user?: a
     });
 
   } catch (error) {
-    console.error('Error al obtener conversaciones:', error);
+    logger.error('Error al obtener conversaciones', { error, userId: req.user?.userId });
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
@@ -111,7 +111,6 @@ router.get('/messages/:otherUserId', authenticateToken, [
       ]
     });
 
-    // Marcar mensajes como leídos
     await ChatMessage.updateMany(
       { receiverId: userId, senderId: otherUserId, isRead: false },
       { isRead: true }
@@ -128,28 +127,36 @@ router.get('/messages/:otherUserId', authenticateToken, [
     });
 
   } catch (error) {
-    console.error('Error al obtener mensajes:', error);
+    logger.error('Error al obtener mensajes', { error, userId: req.user?.userId });
     res.status(500).json({ error: 'Error del servidor' });
   }
 });
 
-// Enviar mensaje (API REST como respaldo)
+// Enviar mensaje (API REST como respaldo del socket)
 router.post('/send', authenticateToken, [
-  require('express-validator').body('content').isLength({ min: 1, max: 1000 }).trim(),
-  require('express-validator').body('type').optional().isIn(['text', 'image', 'video']),
-  require('express-validator').body('fileUrl').optional().isURL()
+  body('content').isLength({ min: 1, max: 1000 }).trim(),
+  body('type').optional().isIn(['text', 'image', 'video']),
+  body('fileUrl').optional().isURL(),
+  body('receiverId').isString().notEmpty(),
 ], async (req: Request & { user?: any }, res: Response) => {
   try {
-    const errors = require('express-validator').validationResult(req);
+    const errors = validationResult(req);
     if (!errors.isEmpty()) {
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { content, type = 'text', fileUrl } = req.body;
-    const { receiverId } = req.body;
+    const { content, type = 'text', fileUrl, receiverId } = req.body;
     const senderId = req.user.userId;
 
-    // Verificar si está suscrito al receptor
+    // Filtro anti-contacto/escort server-side: esto es lo que realmente
+    // protege, la versión del frontend (src/lib/policy.ts) es solo UX.
+    if (type === 'text' && containsForbiddenContact(content)) {
+      logger.warn('Mensaje bloqueado por política de contacto', { senderId, receiverId });
+      return res.status(400).json({
+        error: 'No se permite compartir teléfonos, WhatsApp/Telegram ni proponer encuentros presenciales.'
+      });
+    }
+
     if (req.user.userRole !== 'admin' && req.user.userRole !== 'supervisor') {
       const subscription = await Subscription.findOne({
         fanId: senderId,
@@ -182,7 +189,7 @@ router.post('/send', authenticateToken, [
     });
 
   } catch (error) {
-    console.error('Error al enviar mensaje:', error);
+    logger.error('Error al enviar mensaje', { error, userId: req.user?.userId });
     res.status(500).json({ error: 'Error del servidor' });
   }
 });

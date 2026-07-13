@@ -62,7 +62,10 @@ const UserSchema = new Schema<IUser>({
     default: 9.99
   }
 }, {
-  timestamps: true
+  timestamps: true,
+  // Sin esto los virtuals de abajo no salen al hacer JSON.stringify(user) / res.json(user)
+  toJSON: { virtuals: true },
+  toObject: { virtuals: true }
 });
 
 // Índices para mejor rendimiento
@@ -70,5 +73,21 @@ UserSchema.index({ username: 1 });
 UserSchema.index({ email: 1 });
 UserSchema.index({ role: 1 });
 UserSchema.index({ verificationStatus: 1 });
+
+// Virtuals: no guardan nada en el documento de User, se resuelven con un
+// populate() que busca en otra colección por el campo indicado.
+// creators.ts y users.ts ya intentaban usar .populate('content') y
+// .populate('subscriptions') pero no existían -> el populate no traía nada.
+UserSchema.virtual('content', {
+  ref: 'Content',
+  localField: '_id',
+  foreignField: 'creatorId'
+});
+
+UserSchema.virtual('subscriptions', {
+  ref: 'Subscription',
+  localField: '_id',
+  foreignField: 'fanId'
+});
 
 export const User = mongoose.model<IUser>('User', UserSchema);
